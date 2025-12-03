@@ -1,35 +1,56 @@
 // server.js
 import express from "express";
-import fetch from "node-fetch";
+import cors from "cors";
+import "dotenv/config";
 
 const app = express();
-app.use(express.json());
 
-// 从环境变量读取 HitPaw API Key
+app.use(express.json());
+app.use(cors());
+
+// 注意：不要把真正的 HitPaw API Key 写死在代码里
+// 本地用 .env + dotenv，Render 上用 Dashboard 里的环境变量
 const HITPAW_API_KEY = process.env.HITPAW_API_KEY;
 
-async function createEnhanceJob(imageUrl, format = ".png") {
-  const resp = await fetch("https://api.hitpaw.com/api/v3/photoEnhanceByUrl", {
+if (!HITPAW_API_KEY) {
+  console.warn("Warning: HITPAW_API_KEY is not set. Please configure environment variable.");
+}
+
+// 封装：创建图片增强任务
+async function createEnhanceJob(imageUrl) {
+  const resp = await fetch("https://api-base.niuxuezhang.cn/api/photo-enhancer", {
     method: "POST",
     headers: {
-      "APIKEY": HITPAW_API_KEY,
+      "APIKEY": HITPAW_API_KEY,      // 文档要求 header 里带 APIKEY :contentReference[oaicite:3]{index=3}
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      image_url: imageUrl,
-      image_format: format
+      img_url: imageUrl,
+	  extension: ".jpg",
+	  model_list: ["super_resolution_2x"],
+	  upscale: 2,
+	  exif: true,
+	  DPI: 300
     })
   });
 
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HitPaw create job http error: ${resp.status} - ${text}`);
+  }
+
   const data = await resp.json();
   if (data.code !== 200) {
-    throw new Error(`HitPaw create job failed: ${data.message}`);
+    // 按官方返回格式，code=200 表示成功 :contentReference[oaicite:4]{index=4}
+    throw new Error(`HitPaw create job failed: code=${data.code}, message=${data.message}`);
   }
+
   return data.data.job_id;
 }
 
+// 封装：查询任务结果
 async function queryEnhanceResult(jobId) {
-  const url = `https://api.hitpaw.com/api/v3/photo-enhance/status?job_id=${jobId}`;
+  const url = `https://api-base.niuxuezhang.cn/api/task-status?job_id=${encodeURIComponent(jobId)}`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -38,61 +59,85 @@ async function queryEnhanceResult(jobId) {
     body: JSON.stringify({ job_id: jobId })
   });
 
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HitPaw query status http error: ${resp.status} - ${text}`);
+  }
+
   const data = await resp.json();
   return data;
 }
 
-// 对外的中转接口：一次调用搞定
+// 给 ChatGPT / 其他客户端用的统一入口
 app.post("/enhance-photo", async (req, res) => {
   try {
-    const { image_url, image_format = ".png" } = req.body;
+    const { image_url } = req.body;
+
     if (!image_url) {
       return res.status(400).json({ error: "image_url is required" });
     }
+    if (!HITPAW_API_KEY) {
+      return res.status(500).json({ error: "HITPAW_API_KEY not configured on server" });
+    }
 
-    // 1. 创建任务
-    const jobId = await createEnhanceJob(image_url, image_format);
+    // 1. 先创建任务，拿到 job_id
+    const jobId = await createEnhanceJob(image_url);
 
-    // 2. 轮询任务状态（简单粗暴版）
-    let result = null;
-    const maxAttempts = 20;
-    const intervalMs = 3000;
+    // 2. 轮询任务状态（简单版本）
+    const maxAttempts = 20;       // 最多轮询 20 次
+    const intervalMs = 5000;      // 每次间隔 3 秒
+    let resultData = null;
 
     for (let i = 0; i < maxAttempts; i++) {
-      await new Promise(r => setTimeout(r, intervalMs));
-      const status = await queryEnhanceResult(jobId);
+      // 等待 interval
+      await new Promise((r) => setTimeout(r, intervalMs));
 
-      // 这里需要根据 HitPaw 实际返回结构判断任务成功
-      // 假设 status.data.status === "success" 时成功
-      if (status.data && status.data.status === "success") {
-        result = status.data;
+      const statusResp = await queryEnhanceResult(jobId);
+
+	  const status = statusResp.data?.status;	
+      if (status === "COMPLETED") {
+        resultData = statusResp.data;
         break;
       }
 
-      if (status.data && status.data.status === "failed") {
-        throw new Error(status.data.message || "HitPaw task failed");
+      if (status === "FAILED" || status === "ERROR") {
+        const msg = statusResp.message || "HitPaw task failed";
+        throw new Error(msg);
       }
     }
 
-    if (!result) {
-      return res.status(504).json({ error: "Enhance timeout" });
+    if (!resultData) {
+      return res.status(504).json({
+        error: "Enhance timeout, please try again later.",
+        job_id: jobId
+      });
     }
 
-    // 假设增强后图片地址在 result.output_url（字段名按实际返回改）
+    // 明确返回增强后图片链接，方便 GPT / 前端直接用
+    const enhancedUrl = resultData.res_url;
+    const originalUrl = resultData.original_url;
+
     return res.json({
       code: 200,
       data: {
         job_id: jobId,
-        result: result
+        status: resultData.status,
+        enhanced_url: enhancedUrl,
+        original_url: originalUrl
       }
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Internal server error" });
   }
+});
+
+// 健康检查
+app.get("/", (req, res) => {
+  res.send("HitPaw Photo Proxy is running.");
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
