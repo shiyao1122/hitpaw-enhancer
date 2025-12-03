@@ -1,0 +1,15 @@
+{
+  "name": "hitpaw-photo-proxy",
+  "version": "1.0.0",
+  "description": "Proxy API for HitPaw Photo Enhancer, for ChatGPT Actions",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.0"
+  }
+}
